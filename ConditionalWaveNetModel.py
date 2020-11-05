@@ -176,7 +176,6 @@ class ConditionalWaveNet(nn.Module):
 
     l_mult = self.act_tanh(l_dc_tanh) * self.act_sigmoid(l_dc_gate)
     l_mult_scaled = self.scaling_convs[layer_idx](l_mult)
-    print(data_in.shape, l_mult_scaled.shape, l_mult.shape)
     l_residual = data_in + l_mult_scaled
 
     return l_residual, l_mult_scaled
