@@ -5,13 +5,14 @@ import numpy as np
 
 class ConditionalWaveNet(nn.Module):
 
-  def __init__(self, num_dilated_layers=9, num_filters_glob=64,
+  def __init__(self, num_dilated_layers=1, num_filters_glob=64,
                has_global_cond=False,
                glob_cond_size=100,
                has_local_cond=False,
-               dialated_filter_nums=[96, 96, 96, 96, 96, 128, 128, 128, 128],
+               dialated_filter_nums=[96],
                out_scaling_filter_num=128,
-               output_steps=256):
+               output_steps=256,
+               input_channels=1):
     super(ConditionalWaveNet, self).__init__()
 
     self.num_filters_glob = num_filters_glob
@@ -21,16 +22,16 @@ class ConditionalWaveNet(nn.Module):
     self.glob_cond_size = glob_cond_size
     self.out_scaling_filter_num = out_scaling_filter_num
     self.output_steps = output_steps
-
+    self.input_channels = input_channels
     self.num_dialated_layers = num_dilated_layers
 
     # initialize causal convolution
     self.causal_padding = nn.ConstantPad1d((1, 0), 0)
-    self.causal_conv = nn.Conv1d(in_channels=1, 
+    self.causal_conv = nn.Conv1d(in_channels=self.input_channels, 
                                  out_channels=self.num_filters_glob,
                                  kernel_size=(2,),
-                                 stride=(1,),
-                                 dilation=(1,))
+                                 dilation=(1,),
+                                 bias=False)
 
     # initialize dialated convolutions for tanh activation function and gates
     self.dialated_convs_tanh = nn.ModuleList([])
@@ -42,14 +43,14 @@ class ConditionalWaveNet(nn.Module):
       dial_conv_1d_tanh = nn.Conv1d(in_channels=self.num_filters_glob,
                                     out_channels=self.dialated_filter_nums[i],
                                     kernel_size=(2,),
-                                    stride=(1,),
-                                    dilation=(2**(i+1),))
+                                    dilation=(2**(i+1),),
+                                    bias=False)
 
       dial_conv_1d_gate = nn.Conv1d(in_channels=self.num_filters_glob,
                                     out_channels=self.dialated_filter_nums[i],
                                     kernel_size=(2,),
-                                    stride=(1,),
-                                    dilation=(2**(i+1),))
+                                    dilation=(2**(i+1),),
+                                    bias=False)
       
       self.dialated_convs_padd.append(dial_conv_padd)
       self.dialated_convs_tanh.append(dial_conv_1d_tanh)
@@ -84,27 +85,38 @@ class ConditionalWaveNet(nn.Module):
                                         out_channels=self.dialated_filter_nums[i],
                                         kernel_size=(2,),
                                         stride=(1,),
-                                        dilation=(2**(i+1),))
+                                        dilation=(2**(i+1),),
+                                        bias=False)
 
         local_cond_syn_gate = nn.Conv1d(in_channels=1,
                                         out_channels=self.dialated_filter_nums[i],
                                         kernel_size=(2,),
                                         stride=(1,),
-                                        dilation=(2**(i+1),))
+                                        dilation=(2**(i+1),),
+                                        bias=False)
 
         self.local_cond_padds.append(local_cond_padd)
         self.local_cond_syns_tanh.append(local_cond_syn_tanh)
         self.local_cond_syns_gate.append(local_cond_syn_gate)
 
     # initialize scaling 1x1 convolution Kernels
-    self.scaling_convs = nn.ModuleList([])
+    self.scaling_convs_res = nn.ModuleList([])
+    self.scaling_convs_skip = nn.ModuleList([])
     for i in range(self.num_dialated_layers):
-      scale_conv_1d = nn.Conv1d(in_channels=self.dialated_filter_nums[i],
-                                out_channels=self.num_filters_glob,
-                                kernel_size=(1,),
-                                stride=(1,))
+      scale_conv_1d_res = nn.Conv1d(in_channels=self.dialated_filter_nums[i],
+                                    out_channels=self.num_filters_glob,
+                                    kernel_size=(1,),
+                                    stride=(1,),
+                                    bias=False)
+      
+      scale_conv_1d_skip = nn.Conv1d(in_channels=self.dialated_filter_nums[i],
+                                    out_channels=self.num_filters_glob,
+                                    kernel_size=(1,),
+                                    stride=(1,),
+                                    bias=False)
 
-      self.scaling_convs.append(scale_conv_1d)
+      self.scaling_convs_res.append(scale_conv_1d_res)
+      self.scaling_convs_skip.append(scale_conv_1d_skip)
     
     self.pre_output_scaler = nn.Conv1d(in_channels=self.num_filters_glob,
                                        out_channels=self.out_scaling_filter_num,
@@ -119,7 +131,7 @@ class ConditionalWaveNet(nn.Module):
     self.act_tanh = nn.Tanh()
     self.act_relu = nn.ReLU()
     self.act_sigmoid = nn.Sigmoid()
-    self.act_softmax = nn.Softmax(dim=1)
+    self.act_logsoftmax = nn.LogSoftmax(dim=1)
 
   def causal(self, data):
     padded_d = self.causal_padding(data)
@@ -146,7 +158,7 @@ class ConditionalWaveNet(nn.Module):
     p_o_scaled = self.pre_output_scaler(r_skip_s)
     r_skip_s2 = self.act_relu(p_o_scaled)
     o_scaled = self.output_scaler(r_skip_s2)
-    return self.act_softmax(o_scaled)
+    return self.act_logsoftmax(o_scaled)
 
   def forward(self, data, y=None, h=None):
     data_out, skip = self.foot(data, h=h, y=y)
@@ -175,7 +187,8 @@ class ConditionalWaveNet(nn.Module):
       l_dc_gate += l_cond_gate
 
     l_mult = self.act_tanh(l_dc_tanh) * self.act_sigmoid(l_dc_gate)
-    l_mult_scaled = self.scaling_convs[layer_idx](l_mult)
-    l_residual = data_in + l_mult_scaled
+    l_mult_scaled_res = self.scaling_convs_res[layer_idx](l_mult)
+    l_mult_scaled_skip = self.scaling_convs_skip[layer_idx](l_mult)
+    l_residual = data_in + l_mult_scaled_res
 
-    return l_residual, l_mult_scaled
+    return l_residual, l_mult_scaled_skip
